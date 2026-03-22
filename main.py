@@ -174,6 +174,182 @@ def calculate_spread():
     }
 
     if state["running"] and net_profit >= state["min_spread"]:
+"""
+ETH/USD1 Cross-Exchange Arbitrage Bot
+Exchanges: Binance Global (0% fee) x MEXC (0.05% fee)
+Deploy: Render.com (free tier)
+"""
+
+import asyncio
+import json
+import time
+import hmac
+import hashlib
+import urllib.parse
+import os
+from datetime import datetime
+from collections import deque
+from contextlib import asynccontextmanager
+
+import aiohttp
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+# ── State ──────────────────────────────────────────────────────────────────────
+state = {
+    "binance_price": None, "mexc_price": None,
+    "binance_bid": None, "binance_ask": None,
+    "mexc_bid": None, "mexc_ask": None,
+    "running": False,
+    "capital": 5.0, "min_spread": 0.001, "take_profit": 10.0,
+    "binance_usd1_balance": 0.0, "binance_eth_balance": 0.0,
+    "mexc_usd1_balance": 0.0, "mexc_eth_balance": 0.0,
+    "total_profit": 0.0, "total_trades": 0,
+    "winning_trades": 0, "losing_trades": 0, "total_fees_paid": 0.0,
+    "binance_api_key": "", "binance_api_secret": "",
+    "mexc_api_key": "", "mexc_api_secret": "",
+    "logs": deque(maxlen=200),
+    "trade_history": deque(maxlen=100),
+    "binance_ws_status": "disconnected",
+    "mexc_ws_status": "disconnected",
+    "last_opportunity": None,
+    "spread": 0.0, "spread_pct": 0.0,
+    "buy_exchange": None, "sell_exchange": None,
+}
+
+dashboard_clients = set()
+
+BINANCE_FEE    = 0.0000
+MEXC_FEE       = 0.0005
+SYMBOL_BINANCE = "ETHUSD1"
+SYMBOL_MEXC    = "ETHUSD1"
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load API keys from Render environment variables on startup
+    state["binance_api_key"]    = os.environ.get("BINANCE_API_KEY", "")
+    state["binance_api_secret"] = os.environ.get("BINANCE_API_SECRET", "")
+    state["mexc_api_key"]       = os.environ.get("MEXC_API_KEY", "")
+    state["mexc_api_secret"]    = os.environ.get("MEXC_API_SECRET", "")
+    if state["binance_api_key"]:
+        log("🔑 API keys loaded from environment variables", "SYSTEM")
+    else:
+        log("⚠️ No API keys in environment — running in PAPER mode", "SYSTEM")
+    log("🚀 ARB BOT started", "SYSTEM")
+    asyncio.create_task(binance_ws())
+    asyncio.create_task(mexc_poll())
+    # Fetch balances if keys are available
+    if state["binance_api_key"]:
+        asyncio.create_task(fetch_balances())
+    yield
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+def log(msg: str, level: str = "INFO"):
+    entry = {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg}
+    state["logs"].appendleft(entry)
+    print(f"[{entry['time']}] [{level}] {msg}")
+    asyncio.create_task(broadcast_state())
+
+# ── Broadcast ─────────────────────────────────────────────────────────────────
+async def broadcast_state():
+    global dashboard_clients
+    if not dashboard_clients:
+        return
+    payload = json.dumps(build_payload())
+    dead = set()
+    for client in dashboard_clients:
+        try:
+            await client.send_text(payload)
+        except Exception:
+            dead.add(client)
+    dashboard_clients -= dead
+
+def build_payload():
+    return {
+        "binance_price": state["binance_price"],
+        "mexc_price": state["mexc_price"],
+        "binance_bid": state["binance_bid"],
+        "binance_ask": state["binance_ask"],
+        "mexc_bid": state["mexc_bid"],
+        "mexc_ask": state["mexc_ask"],
+        "spread": state["spread"],
+        "spread_pct": state["spread_pct"],
+        "buy_exchange": state["buy_exchange"],
+        "sell_exchange": state["sell_exchange"],
+        "running": state["running"],
+        "capital": state["capital"],
+        "min_spread": state["min_spread"],
+        "take_profit": state["take_profit"],
+        "binance_usd1_balance": state["binance_usd1_balance"],
+        "binance_eth_balance": state["binance_eth_balance"],
+        "mexc_usd1_balance": state["mexc_usd1_balance"],
+        "mexc_eth_balance": state["mexc_eth_balance"],
+        "total_profit": state["total_profit"],
+        "total_trades": state["total_trades"],
+        "winning_trades": state["winning_trades"],
+        "losing_trades": state["losing_trades"],
+        "total_fees_paid": state["total_fees_paid"],
+        "binance_ws_status": state["binance_ws_status"],
+        "mexc_ws_status": state["mexc_ws_status"],
+        "last_opportunity": state["last_opportunity"],
+        "logs": list(state["logs"])[:50],
+        "trade_history": list(state["trade_history"])[:20],
+        "keys_set": bool(state["binance_api_key"] and state["mexc_api_key"]),
+    }
+
+# ── Spread Calculator ──────────────────────────────────────────────────────────
+def calculate_spread():
+    bp = state["binance_price"]
+    mp = state["mexc_price"]
+    if bp is None or mp is None:
+        return
+
+    if mp <= bp:
+        buy_ex, sell_ex = "MEXC", "BINANCE"
+        buy_price, sell_price = mp, bp
+        buy_fee_rate, sell_fee_rate = MEXC_FEE, BINANCE_FEE
+    else:
+        buy_ex, sell_ex = "BINANCE", "MEXC"
+        buy_price, sell_price = bp, mp
+        buy_fee_rate, sell_fee_rate = BINANCE_FEE, MEXC_FEE
+
+    capital    = state["capital"]
+    eth_qty    = capital / buy_price
+    raw_spread = sell_price - buy_price
+    buy_fee    = capital * buy_fee_rate
+    sell_fee   = (eth_qty * sell_price) * sell_fee_rate
+    net_profit = (raw_spread * eth_qty) - buy_fee - sell_fee
+    spread_pct = (raw_spread / buy_price) * 100
+
+    state["spread"]            = round(raw_spread, 4)
+    state["spread_pct"]        = round(spread_pct, 6)
+    state["buy_exchange"]      = buy_ex
+    state["sell_exchange"]     = sell_ex
+    state["last_opportunity"]  = {
+        "buy_ex": buy_ex, "sell_ex": sell_ex,
+        "buy_price": round(buy_price, 4),
+        "sell_price": round(sell_price, 4),
+        "raw_spread": round(raw_spread, 4),
+        "net_profit": round(net_profit, 6),
+        "eth_qty": round(eth_qty, 6),
+        "buy_fee": round(buy_fee, 6),
+        "sell_fee": round(sell_fee, 6),
+        "spread_pct": round(spread_pct, 6),
+    }
+
+    if state["running"] and net_profit >= state["min_spread"]:
         asyncio.create_task(execute_trade(state["last_opportunity"]))
 
 # ── Trade Execution ────────────────────────────────────────────────────────────
@@ -292,7 +468,7 @@ async def _fetch_mexc_bal():
 
 # ── Binance WebSocket ──────────────────────────────────────────────────────────
 async def binance_ws():
-    url = f"wss://stream.binance.com:9443/ws/{SYMBOL_BINANCE.lower()}@bookTicker"
+    url = f"wss://data-stream.binance.vision/ws/{SYMBOL_BINANCE.lower()}@bookTicker"
     while True:
         try:
             state["binance_ws_status"] = "connecting"
